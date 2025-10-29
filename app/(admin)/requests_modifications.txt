@@ -1,0 +1,4 @@
+Line 39: Add new type after AppointmentRequest type
+Line 50: Add conflictingAppointment state
+Line 168-210: Modify to fetch and store conflicting appointment details
+Line 615-624: Modify modal to show conflicting appointment details

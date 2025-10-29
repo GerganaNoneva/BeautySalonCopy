@@ -1,0 +1,889 @@
+import React, { useEffect, useState, useRef } from 'react';
+import {
+  View,
+  Text,
+  StyleSheet,
+  FlatList,
+  ActivityIndicator,
+  TouchableOpacity,
+  Alert,
+  TextInput,
+  Modal,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import { LinearGradient } from 'expo-linear-gradient';
+import { CheckSquare, XSquare, Calendar, Clock } from 'lucide-react-native';
+import { theme } from '@/constants/theme';
+import { supabase } from '@/lib/supabase';
+import { useAuth } from '@/contexts/AuthContext';
+import { useLocalSearchParams } from 'expo-router';
+
+type AppointmentRequest = {
+  id: string;
+  client_id: string;
+  service_id: string;
+  requested_date: string;
+  requested_time: string;
+  client_message: string;
+  status: string;
+  created_at: string;
+  profiles: {
+    full_name: string;
+    phone: string;
+  };
+  services: {
+    name: string;
+    duration_minutes: number;
+  };
+};
+
+export default function RequestsScreen() {
+  const { user } = useAuth();
+  const params = useLocalSearchParams();
+  const requestsListRef = useRef<FlatList>(null);
+  const [requests, setRequests] = useState<AppointmentRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [highlightRequestId, setHighlightRequestId] = useState<string | null>(null);
+  const [showRejectModal, setShowRejectModal] = useState(false);
+  const [showConflictModal, setShowConflictModal] = useState(false);
+  const [selectedRequest, setSelectedRequest] = useState<AppointmentRequest | null>(null);
+  const [rejectReason, setRejectReason] = useState('');
+  const [conflictReason, setConflictReason] = useState('');
+
+  useEffect(() => {
+    loadRequests();
+
+    // Real-time subscription for appointment requests
+    const requestsChannel = supabase
+      .channel('appointment_requests_changes')
+      .on(
+        'postgres_changes',
+        {
+          event: '*',
+          schema: 'public',
+          table: 'appointment_requests',
+        },
+        (payload) => {
+          console.log('Appointment request change:', payload);
+          loadRequests();
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(requestsChannel);
+    };
+  }, []);
+
+  // Handle navigation from notifications
+  useEffect(() => {
+    if (params.highlightRequestId) {
+      setHighlightRequestId(params.highlightRequestId as string);
+      // Clear highlight after 3 seconds
+      const timer = setTimeout(() => {
+        setHighlightRequestId(null);
+      }, 3000);
+      return () => clearTimeout(timer);
+    }
+  }, [params.highlightRequestId]);
+
+  // Scroll to highlighted request
+  useEffect(() => {
+    if (highlightRequestId && requests.length > 0) {
+      const index = requests.findIndex(r => r.id === highlightRequestId);
+      if (index !== -1) {
+        setTimeout(() => {
+          requestsListRef.current?.scrollToIndex({
+            index,
+            animated: true,
+            viewPosition: 0.5
+          });
+        }, 500);
+      }
+    }
+  }, [highlightRequestId, requests]);
+
+  const loadRequests = async () => {
+    try {
+      setLoading(true);
+      const { data, error } = await supabase
+        .from('appointment_requests')
+        .select(`
+          id,
+          client_id,
+          service_id,
+          requested_date,
+          requested_time::text,
+          client_message,
+          status,
+          created_at,
+          updated_at,
+          profiles(full_name, phone),
+          services(name, duration_minutes)
+        `)
+        .in('status', ['pending', 'rejected'])
+        .order('created_at', { ascending: false });
+
+      if (error) throw error;
+      setRequests(data || []);
+    } catch (err) {
+      console.error('Error loading requests:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleApproveRequest = async (request: AppointmentRequest) => {
+    try {
+      console.log('🔍 Checking for conflicts before approving request...');
+      console.log('Request details:', {
+        date: request.requested_date,
+        time: request.requested_time,
+        duration: request.services.duration_minutes,
+        service: request.services.name
+      });
+
+      // Check for conflicts FIRST before doing anything
+      const endTime = calculateEndTime(
+        request.requested_time,
+        request.services.duration_minutes
+      );
+
+      const timeToMinutes = (timeStr: string): number => {
+        const [hours, minutes] = timeStr.substring(0, 5).split(':').map(Number);
+        return hours * 60 + minutes;
+      };
+
+      const requestStartMinutes = timeToMinutes(request.requested_time);
+      const requestEndMinutes = timeToMinutes(endTime);
+
+      console.log('Request time range:', {
+        startMinutes: requestStartMinutes,
+        endMinutes: requestEndMinutes,
+        startTime: request.requested_time,
+        endTime: endTime
+      });
+
+      // Query for conflicting appointments
+      const { data: conflictingAppointments, error: conflictError } = await supabase
+        .from('appointments')
+        .select('id, start_time::text, end_time::text')
+        .eq('appointment_date', request.requested_date)
+        .neq('status', 'cancelled');
+
+      if (conflictError) {
+        console.error('❌ Error querying appointments:', conflictError);
+        throw conflictError;
+      }
+
+      console.log('Found existing appointments:', conflictingAppointments?.length || 0);
+      if (conflictingAppointments && conflictingAppointments.length > 0) {
+        console.log('Existing appointments:', conflictingAppointments);
+      }
+
+      // Check if any appointment overlaps
+      const hasConflict = (conflictingAppointments || []).some((apt) => {
+        const aptStartMinutes = timeToMinutes(apt.start_time);
+        const aptEndMinutes = timeToMinutes(apt.end_time);
+
+        // Check for any overlap
+        const overlaps = (
+          (requestStartMinutes >= aptStartMinutes && requestStartMinutes < aptEndMinutes) ||
+          (requestEndMinutes > aptStartMinutes && requestEndMinutes <= aptEndMinutes) ||
+          (requestStartMinutes <= aptStartMinutes && requestEndMinutes >= aptEndMinutes)
+        );
+
+        if (overlaps) {
+          console.log('⚠️ CONFLICT DETECTED with appointment:', {
+            aptStart: apt.start_time,
+            aptEnd: apt.end_time,
+            aptStartMinutes,
+            aptEndMinutes
+          });
+        }
+
+        return overlaps;
+      });
+
+      if (hasConflict) {
+        console.log('❌ Conflict found! Showing conflict modal...');
+        // Show conflict modal - DO NOT approve!
+        setSelectedRequest(request);
+        setShowConflictModal(true);
+        return; // STOP HERE - do not proceed with approval
+      }
+
+      console.log('✅ No conflicts found. Proceeding with approval...');
+      // No conflict, proceed with approval
+      await approveRequestAndCreateAppointment(request);
+    } catch (err) {
+      console.error('❌ Error in handleApproveRequest:', err);
+      Alert.alert('Грешка', 'Неуспешно одобряване на заявката');
+    }
+  };
+
+  const approveRequestAndCreateAppointment = async (request: AppointmentRequest) => {
+    try {
+      const endTime = calculateEndTime(
+        request.requested_time,
+        request.services.duration_minutes
+      );
+
+      const { error: appointmentError } = await supabase.from('appointments').insert({
+        client_id: request.client_id,
+        service_id: request.service_id,
+        appointment_date: request.requested_date,
+        start_time: request.requested_time,
+        end_time: endTime,
+        status: 'confirmed',
+      });
+
+      if (appointmentError) throw appointmentError;
+
+      const { error: updateError } = await supabase
+        .from('appointment_requests')
+        .update({ status: 'approved' })
+        .eq('id', request.id);
+
+      if (updateError) throw updateError;
+
+      const { error: notifError } = await supabase.from('notifications').insert({
+        user_id: request.client_id,
+        type: 'booking_confirmed',
+        title: 'Заявката е одобрена',
+        body: `${request.services.name} на ${new Date(request.requested_date).toLocaleDateString('bg-BG')} в ${request.requested_time.slice(0, 5)}`,
+      });
+
+      if (notifError) console.error('Notification error:', notifError);
+
+      await supabase
+        .from('notifications')
+        .update({ is_read: true })
+        .eq('user_id', user?.id)
+        .eq('type', 'new_booking_request')
+        .contains('data', { request_id: request.id });
+
+      loadRequests();
+      Alert.alert('Успех', 'Заявката е одобрена и резервацията е създадена');
+    } catch (err) {
+      console.error('Error approving request:', err);
+      Alert.alert('Грешка', 'Неуспешно одобряване на заявката');
+    }
+  };
+
+  const handleRejectRequest = (request: AppointmentRequest) => {
+    setSelectedRequest(request);
+    setRejectReason('');
+    setShowRejectModal(true);
+  };
+
+  const confirmRejectRequest = async () => {
+    if (!selectedRequest) return;
+
+    try {
+      const { error: updateError } = await supabase
+        .from('appointment_requests')
+        .update({ status: 'rejected' })
+        .eq('id', selectedRequest.id);
+
+      if (updateError) throw updateError;
+
+      let notificationBody = `${selectedRequest.services.name} на ${new Date(selectedRequest.requested_date).toLocaleDateString('bg-BG')} в ${selectedRequest.requested_time.slice(0, 5)}`;
+
+      if (rejectReason.trim()) {
+        notificationBody += `\n\nПричина: ${rejectReason}`;
+      }
+
+      const { error: notifError } = await supabase.from('notifications').insert({
+        user_id: selectedRequest.client_id,
+        type: 'booking_rejected',
+        title: 'Заявката е отхвърлена',
+        body: notificationBody,
+      });
+
+      if (notifError) console.error('Notification error:', notifError);
+
+      setShowRejectModal(false);
+      setRejectReason('');
+      setSelectedRequest(null);
+      loadRequests();
+      Alert.alert('Успех', 'Заявката е отхвърлена и клиентът е уведомен');
+    } catch (err) {
+      console.error('Error rejecting request:', err);
+      Alert.alert('Грешка', 'Неуспешно отхвърляне на заявката');
+    }
+  };
+
+  const confirmConflictReject = async () => {
+    if (!selectedRequest) return;
+
+    try {
+      const { error: updateError } = await supabase
+        .from('appointment_requests')
+        .update({ status: 'rejected' })
+        .eq('id', selectedRequest.id);
+
+      if (updateError) throw updateError;
+
+      let notificationBody = `${selectedRequest.services.name} на ${new Date(selectedRequest.requested_date).toLocaleDateString('bg-BG')} в ${selectedRequest.requested_time.slice(0, 5)} - За дата и часа вече има създадена резервация`;
+
+      if (conflictReason.trim()) {
+        notificationBody += `\n\n${conflictReason}`;
+      }
+
+      const { error: notifError } = await supabase.from('notifications').insert({
+        user_id: selectedRequest.client_id,
+        type: 'booking_rejected',
+        title: 'Заявката е отхвърлена',
+        body: notificationBody,
+      });
+
+      if (notifError) console.error('Notification error:', notifError);
+
+      setShowConflictModal(false);
+      setConflictReason('');
+      setSelectedRequest(null);
+      loadRequests();
+      Alert.alert('Успех', 'Заявката е отхвърлена поради конфликт');
+    } catch (err) {
+      console.error('Error rejecting conflicted request:', err);
+      Alert.alert('Грешка', 'Неуспешно отхвърляне на заявката');
+    }
+  };
+
+  const handleDeleteRequest = async (requestId: string) => {
+    try {
+      const { error } = await supabase
+        .from('appointment_requests')
+        .delete()
+        .eq('id', requestId);
+
+      if (error) throw error;
+
+      loadRequests();
+      Alert.alert('Успех', 'Заявката е изтрита');
+    } catch (err) {
+      console.error('Error deleting request:', err);
+      Alert.alert('Грешка', 'Неуспешно изтриване на заявката');
+    }
+  };
+
+  const handleClearAllRejected = async () => {
+    try {
+      const rejectedRequests = requests.filter(r => r.status === 'rejected');
+
+      if (rejectedRequests.length === 0) {
+        Alert.alert('Информация', 'Няма отхвърлени заявки за изтриване');
+        return;
+      }
+
+      Alert.alert(
+        'Потвърждение',
+        `Сигурни ли сте, че искате да изтриете всички ${rejectedRequests.length} отхвърлени заявки?`,
+        [
+          { text: 'Отказ', style: 'cancel' },
+          {
+            text: 'Изтрий',
+            style: 'destructive',
+            onPress: async () => {
+              const { error } = await supabase
+                .from('appointment_requests')
+                .delete()
+                .eq('status', 'rejected');
+
+              if (error) throw error;
+
+              loadRequests();
+              Alert.alert('Успех', 'Всички отхвърлени заявки са изтрити');
+            }
+          }
+        ]
+      );
+    } catch (err) {
+      console.error('Error clearing rejected requests:', err);
+      Alert.alert('Грешка', 'Неуспешно изтриване на заявките');
+    }
+  };
+
+  const calculateEndTime = (startTime: string, durationMinutes: number): string => {
+    // Handle both "HH:MM" and "HH:MM:SS" formats
+    const timeParts = startTime.substring(0, 5).split(':');
+    const hours = parseInt(timeParts[0], 10);
+    const minutes = parseInt(timeParts[1], 10);
+
+    if (isNaN(hours) || isNaN(minutes)) {
+      console.error('Invalid time format:', startTime);
+      return '00:00';
+    }
+
+    const totalMinutes = hours * 60 + minutes + durationMinutes;
+    const endHours = Math.floor(totalMinutes / 60);
+    const endMinutes = totalMinutes % 60;
+    return `${endHours.toString().padStart(2, '0')}:${endMinutes.toString().padStart(2, '0')}`;
+  };
+
+  const pendingRequests = requests.filter(r => r.status === 'pending');
+
+  const renderRequest = ({ item }: { item: AppointmentRequest }) => {
+    const isHighlighted = highlightRequestId === item.id;
+    return (
+      <View style={[styles.requestCard, isHighlighted && styles.requestCardHighlighted]}>
+        <View style={styles.requestHeader}>
+          <Text style={styles.requestClientName}>{item.profiles.full_name}</Text>
+          <View style={[
+            styles.requestStatusBadge,
+            { backgroundColor: item.status === 'pending' ? theme.colors.warning : item.status === 'approved' ? theme.colors.success : theme.colors.error }
+          ]}>
+            <Text style={styles.requestStatusText}>
+              {item.status === 'pending' ? 'В очакване' : item.status === 'approved' ? 'Одобрена' : 'Отхвърлена'}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.requestDetails}>
+          <View style={styles.requestDetailRow}>
+            <Calendar size={16} color={theme.colors.textMuted} />
+            <Text style={styles.requestDetailText}>
+              {new Date(item.requested_date + 'T00:00:00').toLocaleDateString('bg-BG', {
+                weekday: 'short',
+                day: '2-digit',
+                month: '2-digit',
+                year: 'numeric'
+              })}
+            </Text>
+          </View>
+
+          <View style={styles.requestDetailRow}>
+            <Clock size={16} color={theme.colors.textMuted} />
+            <Text style={styles.requestDetailText}>{item.requested_time.slice(0, 5)}</Text>
+          </View>
+
+          <Text style={styles.requestServiceName}>{item.services.name}</Text>
+
+          {item.client_message && (
+            <View style={styles.requestMessage}>
+              <Text style={styles.requestMessageLabel}>Съобщение:</Text>
+              <Text style={styles.requestMessageText}>{item.client_message}</Text>
+            </View>
+          )}
+        </View>
+
+        {item.status === 'pending' && (
+          <View style={styles.requestActions}>
+            <TouchableOpacity
+              style={[styles.requestActionButton, styles.approveButton]}
+              onPress={() => handleApproveRequest(item)}
+            >
+              <CheckSquare size={18} color={theme.colors.surface} />
+              <Text style={styles.requestActionButtonText}>Одобри</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={[styles.requestActionButton, styles.rejectButton]}
+              onPress={() => handleRejectRequest(item)}
+            >
+              <XSquare size={18} color={theme.colors.surface} />
+              <Text style={styles.requestActionButtonText}>Откажи</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {item.status === 'rejected' && (
+          <View style={styles.requestActions}>
+            <TouchableOpacity
+              style={[styles.requestActionButton, styles.deleteButton]}
+              onPress={() => handleDeleteRequest(item.id)}
+            >
+              <XSquare size={18} color={theme.colors.surface} />
+              <Text style={styles.requestActionButtonText}>Изтрий</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+      </View>
+    );
+  };
+
+  return (
+    <LinearGradient colors={theme.gradients.champagne} style={styles.container}>
+      <SafeAreaView style={styles.safeArea}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Заявки за часове</Text>
+          <Text style={styles.subtitle}>
+            {pendingRequests.length} в очакване
+          </Text>
+        </View>
+
+        {requests.some(r => r.status === 'rejected') && (
+          <View style={styles.clearRejectedContainer}>
+            <TouchableOpacity
+              style={styles.clearRejectedButton}
+              onPress={handleClearAllRejected}
+            >
+              <Text style={styles.clearRejectedText}>Изчисти всички отхвърлени</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {loading ? (
+          <View style={styles.loadingContainer}>
+            <ActivityIndicator size="large" color={theme.colors.primary} />
+            <Text style={styles.loadingText}>Зареждане...</Text>
+          </View>
+        ) : (
+          <FlatList
+            ref={requestsListRef}
+            data={requests}
+            renderItem={renderRequest}
+            keyExtractor={(item) => item.id}
+            contentContainerStyle={styles.listContent}
+            ListEmptyComponent={
+              <View style={styles.emptyContainer}>
+                <Text style={styles.emptyText}>Няма заявки за часове</Text>
+              </View>
+            }
+            refreshing={loading}
+            onRefresh={loadRequests}
+            onScrollToIndexFailed={(info) => {
+              const wait = new Promise(resolve => setTimeout(resolve, 500));
+              wait.then(() => {
+                requestsListRef.current?.scrollToIndex({ index: info.index, animated: true });
+              });
+            }}
+          />
+        )}
+
+        {/* Reject Request Modal */}
+        <Modal
+          visible={showRejectModal}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setShowRejectModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.actionModalContent}>
+              <Text style={styles.modalTitle}>Отхвърляне на заявка</Text>
+              {selectedRequest && (
+                <Text style={styles.modalSubtitle}>
+                  {selectedRequest.profiles.full_name} - {selectedRequest.services.name}
+                  {'\n'}
+                  {new Date(selectedRequest.requested_date).toLocaleDateString('bg-BG')} в {selectedRequest.requested_time.slice(0, 5)}
+                </Text>
+              )}
+
+              <View style={styles.inputContainer}>
+                <Text style={styles.inputLabel}>Причина (опционално):</Text>
+                <TextInput
+                  style={[styles.timeTextInput, { height: 80, textAlignVertical: 'top' }]}
+                  value={rejectReason}
+                  onChangeText={setRejectReason}
+                  placeholder="Въведете причина за отхвърлянето..."
+                  placeholderTextColor={theme.colors.textMuted}
+                  multiline
+                  numberOfLines={3}
+                />
+              </View>
+
+              <TouchableOpacity
+                style={styles.rejectConfirmButton}
+                onPress={confirmRejectRequest}
+              >
+                <Text style={styles.rejectConfirmText}>Отхвърли заявката</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => {
+                  setShowRejectModal(false);
+                  setRejectReason('');
+                }}
+              >
+                <Text style={styles.cancelButtonText}>Назад</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+
+        {/* Conflict Modal */}
+        <Modal
+          visible={showConflictModal}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setShowConflictModal(false)}
+        >
+          <View style={styles.modalOverlay}>
+            <View style={styles.actionModalContent}>
+              <Text style={styles.modalTitle}>Конфликт на резервация</Text>
+              {selectedRequest && (
+                <Text style={styles.modalSubtitle}>
+                  За дата и часа вече има създадена резервация
+                  {'\n\n'}
+                  {selectedRequest.profiles.full_name} - {selectedRequest.services.name}
+                  {'\n'}
+                  {new Date(selectedRequest.requested_date).toLocaleDateString('bg-BG')} в {selectedRequest.requested_time.slice(0, 5)}
+                </Text>
+              )}
+
+              <View style={styles.inputContainer}>
+                <Text style={styles.inputLabel}>Съобщение до клиента (опционално):</Text>
+                <TextInput
+                  style={[styles.timeTextInput, { height: 80, textAlignVertical: 'top' }]}
+                  value={conflictReason}
+                  onChangeText={setConflictReason}
+                  placeholder="Допълнително съобщение..."
+                  placeholderTextColor={theme.colors.textMuted}
+                  multiline
+                  numberOfLines={3}
+                />
+              </View>
+
+              <TouchableOpacity
+                style={styles.rejectConfirmButton}
+                onPress={confirmConflictReject}
+              >
+                <Text style={styles.rejectConfirmText}>Отхвърли заявката</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={styles.cancelButton}
+                onPress={() => {
+                  setShowConflictModal(false);
+                  setConflictReason('');
+                }}
+              >
+                <Text style={styles.cancelButtonText}>Назад</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </Modal>
+      </SafeAreaView>
+    </LinearGradient>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+  },
+  safeArea: {
+    flex: 1,
+  },
+  header: {
+    padding: theme.spacing.lg,
+    paddingTop: theme.spacing.xl,
+  },
+  title: {
+    fontSize: theme.fontSize.xxl,
+    fontWeight: '700',
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+  },
+  subtitle: {
+    fontSize: theme.fontSize.md,
+    color: theme.colors.textMuted,
+  },
+  loadingContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    gap: theme.spacing.md,
+  },
+  loadingText: {
+    fontSize: theme.fontSize.md,
+    color: theme.colors.textMuted,
+  },
+  listContent: {
+    padding: theme.spacing.md,
+    paddingBottom: theme.spacing.xxl,
+  },
+  emptyContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingVertical: theme.spacing.xxl * 2,
+  },
+  emptyText: {
+    fontSize: theme.fontSize.lg,
+    color: theme.colors.textMuted,
+    textAlign: 'center',
+  },
+  clearRejectedContainer: {
+    paddingHorizontal: theme.spacing.md,
+    paddingBottom: theme.spacing.sm,
+  },
+  clearRejectedButton: {
+    backgroundColor: theme.colors.error,
+    borderRadius: theme.borderRadius.md,
+    padding: theme.spacing.sm,
+    alignItems: 'center',
+  },
+  clearRejectedText: {
+    fontSize: theme.fontSize.sm,
+    fontWeight: '600',
+    color: theme.colors.surface,
+  },
+  requestCard: {
+    backgroundColor: 'rgba(255, 255, 255, 0.95)',
+    borderRadius: theme.borderRadius.sm,
+    padding: theme.spacing.md,
+    marginBottom: theme.spacing.md,
+    ...theme.shadows.sm,
+  },
+  requestCardHighlighted: {
+    backgroundColor: 'rgba(255, 215, 0, 0.3)',
+    borderWidth: 2,
+    borderColor: theme.colors.primary,
+    ...theme.shadows.md,
+  },
+  requestHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: theme.spacing.sm,
+  },
+  requestClientName: {
+    fontSize: theme.fontSize.lg,
+    fontWeight: '700',
+    color: theme.colors.text,
+  },
+  requestStatusBadge: {
+    paddingHorizontal: theme.spacing.sm,
+    paddingVertical: 4,
+    borderRadius: theme.borderRadius.sm,
+  },
+  requestStatusText: {
+    fontSize: theme.fontSize.xs,
+    fontWeight: '600',
+    color: theme.colors.surface,
+  },
+  requestDetails: {
+    marginBottom: theme.spacing.md,
+  },
+  requestDetailRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: theme.spacing.xs,
+    marginBottom: theme.spacing.xs,
+  },
+  requestDetailText: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.textMuted,
+  },
+  requestServiceName: {
+    fontSize: theme.fontSize.md,
+    fontWeight: '600',
+    color: theme.colors.text,
+    marginTop: theme.spacing.xs,
+  },
+  requestMessage: {
+    marginTop: theme.spacing.sm,
+    padding: theme.spacing.sm,
+    backgroundColor: theme.colors.cream,
+    borderRadius: theme.borderRadius.sm,
+  },
+  requestMessageLabel: {
+    fontSize: theme.fontSize.xs,
+    fontWeight: '600',
+    color: theme.colors.textMuted,
+    marginBottom: 4,
+  },
+  requestMessageText: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.text,
+  },
+  requestActions: {
+    flexDirection: 'row',
+    gap: theme.spacing.sm,
+  },
+  requestActionButton: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: theme.spacing.xs,
+    padding: theme.spacing.sm,
+    borderRadius: theme.borderRadius.sm,
+  },
+  approveButton: {
+    backgroundColor: theme.colors.success,
+  },
+  rejectButton: {
+    backgroundColor: theme.colors.error,
+  },
+  deleteButton: {
+    backgroundColor: theme.colors.error,
+  },
+  requestActionButtonText: {
+    fontSize: theme.fontSize.sm,
+    fontWeight: '600',
+    color: theme.colors.surface,
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: theme.spacing.lg,
+  },
+  actionModalContent: {
+    backgroundColor: theme.colors.surface,
+    borderRadius: theme.borderRadius.xl,
+    padding: theme.spacing.xl,
+    width: '100%',
+    maxWidth: 400,
+    ...theme.shadows.luxury,
+  },
+  modalTitle: {
+    fontSize: theme.fontSize.lg,
+    fontWeight: '700',
+    color: theme.colors.text,
+    marginBottom: theme.spacing.xs,
+    textAlign: 'center',
+  },
+  modalSubtitle: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.textMuted,
+    marginBottom: theme.spacing.xl,
+    textAlign: 'center',
+  },
+  inputContainer: {
+    marginBottom: theme.spacing.lg,
+  },
+  inputLabel: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.text,
+    fontWeight: '600',
+    marginBottom: theme.spacing.xs,
+  },
+  timeTextInput: {
+    backgroundColor: theme.colors.cream,
+    borderRadius: theme.borderRadius.md,
+    padding: theme.spacing.md,
+    fontSize: theme.fontSize.md,
+    color: theme.colors.text,
+    borderWidth: 1,
+    borderColor: theme.colors.border,
+  },
+  rejectConfirmButton: {
+    backgroundColor: theme.colors.error,
+    borderRadius: theme.borderRadius.md,
+    padding: theme.spacing.md,
+    alignItems: 'center',
+    marginBottom: theme.spacing.sm,
+    ...theme.shadows.md,
+  },
+  rejectConfirmText: {
+    fontSize: theme.fontSize.md,
+    fontWeight: '700',
+    color: theme.colors.surface,
+  },
+  cancelButton: {
+    padding: theme.spacing.md,
+    alignItems: 'center',
+    marginTop: theme.spacing.sm,
+  },
+  cancelButtonText: {
+    fontSize: theme.fontSize.sm,
+    color: theme.colors.textMuted,
+    fontWeight: '600',
+  },
+});
